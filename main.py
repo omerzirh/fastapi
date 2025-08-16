@@ -1,7 +1,6 @@
-# main.py
 import os
 import logging
-from typing import List, Optional
+from typing import List, Optional, Any, Union
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -17,7 +16,26 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app first
+# Try to import LangChain dependencies with graceful fallback
+try:
+    from langchain.agents import AgentExecutor
+    from langchain_openai import ChatOpenAI
+    from langchain_core.messages import SystemMessage, AIMessage, HumanMessage
+    from langchain.agents import create_tool_calling_agent
+    from langchain import hub
+    from langchain_community.vectorstores import SupabaseVectorStore
+    from langchain_openai import OpenAIEmbeddings
+    from langchain_core.tools import tool
+    from supabase.client import Client, create_client
+    LANGCHAIN_AVAILABLE = True
+    logger.info("LangChain dependencies loaded successfully")
+except ImportError as e:
+    logger.warning(f"LangChain imports failed: {e}")
+    LANGCHAIN_AVAILABLE = False
+    # Define placeholder for type hints
+    AgentExecutor = Any
+
+# Initialize FastAPI app
 app = FastAPI(
     title="Agentic RAG API",
     description="RAG-powered chatbot API with document retrieval",
@@ -51,6 +69,8 @@ class ChatResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     message: str
+    rag_available: bool
+    langchain_available: bool
 
 # Global variables for the RAG system
 agent_executor = None
@@ -62,18 +82,12 @@ def initialize_rag_system():
     """Initialize the RAG system components"""
     global agent_executor, vector_store, rag_initialized, initialization_error
     
+    if not LANGCHAIN_AVAILABLE:
+        initialization_error = "LangChain dependencies not available"
+        rag_initialized = False
+        return False
+    
     try:
-        # Import langchain components here to avoid import errors
-        from langchain.agents import AgentExecutor
-        from langchain_openai import ChatOpenAI
-        from langchain_core.messages import SystemMessage, AIMessage, HumanMessage
-        from langchain.agents import create_tool_calling_agent
-        from langchain import hub
-        from langchain_community.vectorstores import SupabaseVectorStore
-        from langchain_openai import OpenAIEmbeddings
-        from langchain_core.tools import tool
-        from supabase.client import Client, create_client
-        
         # Check environment variables
         required_vars = ["SUPABASE_URL", "SUPABASE_SERVICE_KEY", "OPENAI_API_KEY"]
         missing_vars = [var for var in required_vars if not os.environ.get(var)]
@@ -144,6 +158,12 @@ def initialize_rag_system():
 
 def get_agent_executor():
     """Dependency to get the agent executor"""
+    if not LANGCHAIN_AVAILABLE:
+        raise HTTPException(
+            status_code=503, 
+            detail="LangChain dependencies not available. Please check installation."
+        )
+    
     if not rag_initialized or agent_executor is None:
         raise HTTPException(
             status_code=503, 
@@ -153,8 +173,10 @@ def get_agent_executor():
 
 def convert_chat_history(chat_history: List[ChatMessage]):
     """Convert chat history to LangChain message format"""
+    if not LANGCHAIN_AVAILABLE:
+        return []
+    
     try:
-        from langchain_core.messages import HumanMessage, AIMessage
         messages = []
         for msg in chat_history:
             if msg.role == "user":
@@ -175,6 +197,7 @@ async def root():
         "version": "1.0.0",
         "status": "healthy" if rag_initialized else "initializing",
         "rag_available": rag_initialized,
+        "langchain_available": LANGCHAIN_AVAILABLE,
         "endpoints": {
             "health": "/health",
             "chat": "/chat",
@@ -186,21 +209,47 @@ async def root():
     }
 
 # Health check endpoint
-@app.get("/health")
+@app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint"""
     if rag_initialized:
-        return {"status": "healthy", "message": "Service is running", "rag_available": True}
+        return HealthResponse(
+            status="healthy", 
+            message="Service is running", 
+            rag_available=True,
+            langchain_available=LANGCHAIN_AVAILABLE
+        )
+    elif not LANGCHAIN_AVAILABLE:
+        return HealthResponse(
+            status="degraded", 
+            message="LangChain dependencies not available", 
+            rag_available=False,
+            langchain_available=False
+        )
     elif initialization_error:
-        return {"status": "degraded", "message": f"RAG system error: {initialization_error}", "rag_available": False}
+        return HealthResponse(
+            status="degraded", 
+            message=f"RAG system error: {initialization_error}", 
+            rag_available=False,
+            langchain_available=LANGCHAIN_AVAILABLE
+        )
     else:
-        return {"status": "starting", "message": "RAG system initializing...", "rag_available": False}
+        return HealthResponse(
+            status="starting", 
+            message="RAG system initializing...", 
+            rag_available=False,
+            langchain_available=LANGCHAIN_AVAILABLE
+        )
 
 # Manual initialization endpoint
 @app.post("/initialize")
 async def manual_initialize():
     """Manually trigger RAG system initialization"""
     global initialization_error
+    
+    if not LANGCHAIN_AVAILABLE:
+        return {"status": "error", "message": "LangChain dependencies not available"}
+    
     initialization_error = None
     success = initialize_rag_system()
     if success:
@@ -209,7 +258,7 @@ async def manual_initialize():
         return {"status": "error", "message": f"Failed to initialize: {initialization_error}"}
 
 # Chat endpoint
-@app.post("/chat")
+@app.post("/chat", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
     executor: AgentExecutor = Depends(get_agent_executor)
@@ -234,7 +283,7 @@ async def chat(
             for step in result["intermediate_steps"]:
                 if len(step) > 1 and hasattr(step[1], 'artifact'):
                     # Extract document sources
-                    docs = step[1].artifact
+                    docs = step.artifact
                     for doc in docs:
                         sources.append({
                             "content": doc.page_content[:200] + "...",
@@ -275,6 +324,9 @@ async def query(
 async def search_documents(query: str, k: int = 3):
     """Direct document search endpoint"""
     try:
+        if not LANGCHAIN_AVAILABLE:
+            raise HTTPException(status_code=503, detail="LangChain dependencies not available")
+        
         if not rag_initialized or vector_store is None:
             raise HTTPException(status_code=503, detail="Vector store not available")
         
@@ -303,8 +355,14 @@ async def search_documents(query: str, k: int = 3):
 async def startup_event():
     """Initialize the RAG system on startup"""
     logger.info("Starting application...")
+    logger.info(f"LangChain available: {LANGCHAIN_AVAILABLE}")
+    
     # Try to initialize RAG system, but don't fail startup if it doesn't work
-    initialize_rag_system()
+    if LANGCHAIN_AVAILABLE:
+        initialize_rag_system()
+    else:
+        logger.warning("Skipping RAG initialization - LangChain dependencies not available")
+    
     logger.info("Application startup complete")
 
 if __name__ == "__main__":
