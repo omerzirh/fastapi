@@ -10,29 +10,14 @@ from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# Langchain imports
-from langchain.agents import AgentExecutor
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import SystemMessage, AIMessage, HumanMessage
-from langchain.agents import create_tool_calling_agent
-from langchain import hub
-from langchain_core.prompts import PromptTemplate
-from langchain_community.vectorstores import SupabaseVectorStore
-from langchain_openai import OpenAIEmbeddings
-from langchain_core.tools import tool
-
-# Supabase imports
-from supabase.client import Client, create_client
-
-# Load environment variables
+# Load environment variables first
 load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app
+# Initialize FastAPI app first
 app = FastAPI(
     title="Agentic RAG API",
     description="RAG-powered chatbot API with document retrieval",
@@ -70,12 +55,25 @@ class HealthResponse(BaseModel):
 # Global variables for the RAG system
 agent_executor = None
 vector_store = None
+rag_initialized = False
+initialization_error = None
 
 def initialize_rag_system():
     """Initialize the RAG system components"""
-    global agent_executor, vector_store
+    global agent_executor, vector_store, rag_initialized, initialization_error
     
     try:
+        # Import langchain components here to avoid import errors
+        from langchain.agents import AgentExecutor
+        from langchain_openai import ChatOpenAI
+        from langchain_core.messages import SystemMessage, AIMessage, HumanMessage
+        from langchain.agents import create_tool_calling_agent
+        from langchain import hub
+        from langchain_community.vectorstores import SupabaseVectorStore
+        from langchain_openai import OpenAIEmbeddings
+        from langchain_core.tools import tool
+        from supabase.client import Client, create_client
+        
         # Check environment variables
         required_vars = ["SUPABASE_URL", "SUPABASE_SERVICE_KEY", "OPENAI_API_KEY"]
         missing_vars = [var for var in required_vars if not os.environ.get(var)]
@@ -83,13 +81,17 @@ def initialize_rag_system():
         if missing_vars:
             raise ValueError(f"Missing environment variables: {', '.join(missing_vars)}")
 
+        logger.info("Starting RAG system initialization...")
+
         # Initialize Supabase
         supabase_url = os.environ.get("SUPABASE_URL")
         supabase_key = os.environ.get("SUPABASE_SERVICE_KEY")
         supabase: Client = create_client(supabase_url, supabase_key)
+        logger.info("Supabase client initialized")
         
         # Initialize embeddings
         embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+        logger.info("Embeddings model initialized")
         
         # Initialize vector store
         vector_store = SupabaseVectorStore(
@@ -98,12 +100,15 @@ def initialize_rag_system():
             table_name="documents",
             query_name="match_documents",
         )
+        logger.info("Vector store initialized")
         
         # Initialize LLM
         llm = ChatOpenAI(model="gpt-4o", temperature=0)
+        logger.info("LLM initialized")
         
         # Pull prompt from hub
         prompt = hub.pull("hwchase17/openai-functions-agent")
+        logger.info("Prompt pulled from hub")
         
         # Create retriever tool
         @tool(response_format="content_and_artifact")
@@ -125,56 +130,86 @@ def initialize_rag_system():
         agent = create_tool_calling_agent(llm, tools, prompt)
         agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
         
+        rag_initialized = True
+        initialization_error = None
         logger.info("RAG system initialized successfully")
         return True
         
     except Exception as e:
-        logger.error(f"Failed to initialize RAG system: {e}")
-        raise e
+        error_msg = f"Failed to initialize RAG system: {e}"
+        logger.error(error_msg)
+        initialization_error = str(e)
+        rag_initialized = False
+        return False
 
 def get_agent_executor():
     """Dependency to get the agent executor"""
-    if agent_executor is None:
-        raise HTTPException(status_code=500, detail="RAG system not initialized")
+    if not rag_initialized or agent_executor is None:
+        raise HTTPException(
+            status_code=503, 
+            detail=f"RAG system not available. Error: {initialization_error or 'System not initialized'}"
+        )
     return agent_executor
 
 def convert_chat_history(chat_history: List[ChatMessage]):
     """Convert chat history to LangChain message format"""
-    messages = []
-    for msg in chat_history:
-        if msg.role == "user":
-            messages.append(HumanMessage(content=msg.content))
-        elif msg.role == "assistant":
-            messages.append(AIMessage(content=msg.content))
-    return messages
-
-# Startup event
-@app.on_event("startup")
-async def startup_event():
-    """Initialize the RAG system on startup"""
     try:
-        initialize_rag_system()
-        logger.info("Application started successfully")
+        from langchain_core.messages import HumanMessage, AIMessage
+        messages = []
+        for msg in chat_history:
+            if msg.role == "user":
+                messages.append(HumanMessage(content=msg.content))
+            elif msg.role == "assistant":
+                messages.append(AIMessage(content=msg.content))
+        return messages
     except Exception as e:
-        logger.error(f"Failed to start application: {e}")
-        raise e
+        logger.error(f"Error converting chat history: {e}")
+        return []
+
+# Root endpoint
+@app.get("/")
+async def root():
+    """Root endpoint with API information"""
+    return {
+        "message": "Agentic RAG API",
+        "version": "1.0.0",
+        "status": "healthy" if rag_initialized else "initializing",
+        "rag_available": rag_initialized,
+        "endpoints": {
+            "health": "/health",
+            "chat": "/chat",
+            "query": "/query", 
+            "search": "/search",
+            "docs": "/docs",
+            "initialize": "/initialize"
+        }
+    }
 
 # Health check endpoint
-@app.get("/health", response_model=HealthResponse)
+@app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    try:
-        # Test if agent is working
-        if agent_executor is None:
-            return HealthResponse(status="unhealthy", message="RAG system not initialized")
-        
-        return HealthResponse(status="healthy", message="Service is running")
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return HealthResponse(status="unhealthy", message=str(e))
+    if rag_initialized:
+        return {"status": "healthy", "message": "Service is running", "rag_available": True}
+    elif initialization_error:
+        return {"status": "degraded", "message": f"RAG system error: {initialization_error}", "rag_available": False}
+    else:
+        return {"status": "starting", "message": "RAG system initializing...", "rag_available": False}
+
+# Manual initialization endpoint
+@app.post("/initialize")
+async def manual_initialize():
+    """Manually trigger RAG system initialization"""
+    global initialization_error
+    initialization_error = None
+    success = initialize_rag_system()
+    if success:
+        return {"status": "success", "message": "RAG system initialized successfully"}
+    else:
+        return {"status": "error", "message": f"Failed to initialize: {initialization_error}"}
 
 # Chat endpoint
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/chat")
 async def chat(
     request: ChatRequest,
     executor: AgentExecutor = Depends(get_agent_executor)
@@ -240,8 +275,8 @@ async def query(
 async def search_documents(query: str, k: int = 3):
     """Direct document search endpoint"""
     try:
-        if vector_store is None:
-            raise HTTPException(status_code=500, detail="Vector store not initialized")
+        if not rag_initialized or vector_store is None:
+            raise HTTPException(status_code=503, detail="Vector store not available")
         
         docs = vector_store.similarity_search(query, k=k)
         
@@ -263,21 +298,14 @@ async def search_documents(query: str, k: int = 3):
         logger.error(f"Search endpoint error: {e}")
         raise HTTPException(status_code=500, detail=f"Error searching documents: {str(e)}")
 
-# Root endpoint
-@app.get("/")
-async def root():
-    """Root endpoint with API information"""
-    return {
-        "message": "Agentic RAG API",
-        "version": "1.0.0",
-        "endpoints": {
-            "health": "/health",
-            "chat": "/chat",
-            "query": "/query",
-            "search": "/search",
-            "docs": "/docs"
-        }
-    }
+# Initialize RAG system on startup (but don't fail if it doesn't work)
+@app.on_event("startup")
+async def startup_event():
+    """Initialize the RAG system on startup"""
+    logger.info("Starting application...")
+    # Try to initialize RAG system, but don't fail startup if it doesn't work
+    initialize_rag_system()
+    logger.info("Application startup complete")
 
 if __name__ == "__main__":
     import uvicorn
