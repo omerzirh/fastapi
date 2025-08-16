@@ -42,14 +42,20 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Configure CORS
+origins = [
+    "https://omerzirh.com",       # production SPA
+    "http://localhost:5173/",      # local dev
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure this for production
+    allow_origins=origins,        # <— no "*"
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],         # optional: let the browser read custom headers
 )
+
 
 # Pydantic models
 class ChatMessage(BaseModel):
